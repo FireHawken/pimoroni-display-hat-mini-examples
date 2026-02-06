@@ -5,7 +5,7 @@ A NumPy-free replacement for the official displayhatmini library,
 using luma.lcd for display communication.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 import atexit
 
@@ -13,6 +13,13 @@ import RPi.GPIO as GPIO
 from luma.core.interface.serial import spi
 from luma.lcd.device import st7789
 from PIL import Image
+
+# Try to import pigpio for hardware PWM (flicker-free backlight)
+try:
+    import pigpio
+    _PIGPIO_AVAILABLE = True
+except ImportError:
+    _PIGPIO_AVAILABLE = False
 
 
 class DisplayHATMini:
@@ -47,9 +54,12 @@ class DisplayHATMini:
     WIDTH = 320
     HEIGHT = 240
 
-    # PWM frequency
+    # PWM frequency for software PWM fallback
     LED_PWM_FREQ = 2000
-    BACKLIGHT_PWM_FREQ = 500
+    BACKLIGHT_PWM_FREQ = 10000  # 10 kHz for reduced flicker
+
+    # Hardware PWM frequency (pigpio) - can be much higher for flicker-free
+    BACKLIGHT_HW_PWM_FREQ = 25000  # 25 kHz
 
     # SPI speed - 80 MHz works reliably and gives good performance
     SPI_SPEED_HZ = 80_000_000  # 80 MHz
@@ -62,10 +72,18 @@ class DisplayHATMini:
             backlight_pwm: If True, use PWM for dimmable backlight.
             spi_speed_hz: SPI bus speed in Hz. Default 80 MHz for best performance.
                          Can try 100_000_000 for ~20 FPS if display is stable.
+
+        Note:
+            For flicker-free backlight dimming, install pigpio and start the daemon:
+                sudo apt install pigpio python3-pigpio
+                sudo systemctl enable pigpiod
+                sudo systemctl start pigpiod
         """
         self._backlight_pwm_enabled = backlight_pwm
         self._spi_speed = spi_speed_hz or self.SPI_SPEED_HZ
         self._button_callback = None
+        self._pigpio = None
+        self._using_hw_pwm = False
 
         # Initialize GPIO
         GPIO.setmode(GPIO.BCM)
@@ -84,12 +102,32 @@ class DisplayHATMini:
             self._led_pwm[pin] = pwm
 
         # Set up backlight
-        GPIO.setup(self.BACKLIGHT, GPIO.OUT)
+        self._backlight_pwm = None
         if backlight_pwm:
-            self._backlight_pwm = GPIO.PWM(self.BACKLIGHT, self.BACKLIGHT_PWM_FREQ)
-            self._backlight_pwm.start(100)  # Full brightness
+            # Try hardware PWM via pigpio first (flicker-free)
+            if _PIGPIO_AVAILABLE:
+                try:
+                    self._pigpio = pigpio.pi()
+                    if self._pigpio.connected:
+                        # Use hardware PWM: frequency in Hz, duty 0-1000000
+                        self._pigpio.hardware_PWM(
+                            self.BACKLIGHT,
+                            self.BACKLIGHT_HW_PWM_FREQ,
+                            1000000  # 100% duty = full brightness
+                        )
+                        self._using_hw_pwm = True
+                    else:
+                        self._pigpio = None
+                except Exception:
+                    self._pigpio = None
+
+            # Fall back to software PWM if hardware PWM not available
+            if not self._using_hw_pwm:
+                GPIO.setup(self.BACKLIGHT, GPIO.OUT)
+                self._backlight_pwm = GPIO.PWM(self.BACKLIGHT, self.BACKLIGHT_PWM_FREQ)
+                self._backlight_pwm.start(100)  # Full brightness
         else:
-            self._backlight_pwm = None
+            GPIO.setup(self.BACKLIGHT, GPIO.OUT)
             GPIO.output(self.BACKLIGHT, GPIO.HIGH)
 
         # Initialize display via luma.lcd
@@ -151,9 +189,18 @@ class DisplayHATMini:
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"Backlight value must be between 0.0 and 1.0 (got {value})")
 
-        if self._backlight_pwm:
+        if self._using_hw_pwm and self._pigpio:
+            # Hardware PWM: duty cycle is 0-1000000
+            self._pigpio.hardware_PWM(
+                self.BACKLIGHT,
+                self.BACKLIGHT_HW_PWM_FREQ,
+                int(value * 1000000)
+            )
+        elif self._backlight_pwm:
+            # Software PWM fallback
             self._backlight_pwm.ChangeDutyCycle(value * 100)
         else:
+            # Simple on/off
             GPIO.output(self.BACKLIGHT, GPIO.HIGH if value > 0 else GPIO.LOW)
 
     def display(self, image: Image.Image) -> None:
@@ -216,17 +263,28 @@ class DisplayHATMini:
         # Buttons are active low (pressed = LOW)
         return not GPIO.input(pin)
 
+    @property
+    def using_hardware_pwm(self) -> bool:
+        """Return True if using hardware PWM for backlight (flicker-free)."""
+        return self._using_hw_pwm
+
     def _cleanup(self) -> None:
         """Clean up GPIO resources."""
-        # Stop PWM
+        # Stop software PWM
         for pwm in self._led_pwm.values():
             pwm.stop()
         if self._backlight_pwm:
             self._backlight_pwm.stop()
 
+        # Stop hardware PWM
+        if self._pigpio and self._using_hw_pwm:
+            self._pigpio.hardware_PWM(self.BACKLIGHT, 0, 0)
+            self._pigpio.stop()
+
         # Turn off LED and backlight
         for pin in (self.LED_R, self.LED_G, self.LED_B):
             GPIO.output(pin, GPIO.HIGH)  # LED off
+        GPIO.setup(self.BACKLIGHT, GPIO.OUT)
         GPIO.output(self.BACKLIGHT, GPIO.LOW)  # Backlight off
 
     def __del__(self):
