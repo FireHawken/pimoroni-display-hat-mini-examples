@@ -5,21 +5,89 @@ A NumPy-free replacement for the official displayhatmini library,
 using luma.lcd for display communication.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 import atexit
+import os
+import time
 
 import RPi.GPIO as GPIO
 from luma.core.interface.serial import spi
 from luma.lcd.device import st7789
 from PIL import Image
 
-# Try to import pigpio for hardware PWM (flicker-free backlight)
-try:
-    import pigpio
-    _PIGPIO_AVAILABLE = True
-except ImportError:
-    _PIGPIO_AVAILABLE = False
+
+class KernelPWM:
+    """Control PWM via kernel sysfs interface (more stable than pigpio)."""
+
+    def __init__(self, chip=0, channel=0):
+        self.chip = chip
+        self.channel = channel
+        self.base_path = f"/sys/class/pwm/pwmchip{chip}"
+        self.pwm_path = f"{self.base_path}/pwm{channel}"
+        self._exported = False
+        self._period_ns = 0
+        self._enabled = False
+
+    def _export(self):
+        """Export the PWM channel."""
+        if not os.path.exists(self.pwm_path):
+            try:
+                with open(f"{self.base_path}/export", "w") as f:
+                    f.write(str(self.channel))
+                time.sleep(0.1)  # Wait for sysfs to create files
+            except (IOError, OSError):
+                return False
+        self._exported = True
+        return True
+
+    def _write(self, filename, value):
+        """Write value to sysfs file."""
+        try:
+            with open(f"{self.pwm_path}/{filename}", "w") as f:
+                f.write(str(value))
+            return True
+        except (IOError, OSError):
+            return False
+
+    def set_frequency(self, freq_hz):
+        """Set PWM frequency in Hz."""
+        period_ns = int(1_000_000_000 / freq_hz)
+        if self._enabled:
+            self._write("enable", 0)
+        self._write("period", period_ns)
+        self._period_ns = period_ns
+
+    def set_duty_cycle(self, duty_percent):
+        """Set duty cycle as percentage (0-100)."""
+        if self._period_ns > 0:
+            duty_ns = int(self._period_ns * duty_percent / 100)
+            self._write("duty_cycle", duty_ns)
+
+    def enable(self):
+        """Enable PWM output."""
+        if self._write("enable", 1):
+            self._enabled = True
+
+    def disable(self):
+        """Disable PWM output."""
+        if self._write("enable", 0):
+            self._enabled = False
+
+    def cleanup(self):
+        """Unexport the PWM channel."""
+        if self._exported:
+            try:
+                self.disable()
+                with open(f"{self.base_path}/unexport", "w") as f:
+                    f.write(str(self.channel))
+            except (IOError, OSError):
+                pass
+
+    @classmethod
+    def is_available(cls, chip=0, channel=0):
+        """Check if kernel PWM is available."""
+        return os.path.exists(f"/sys/class/pwm/pwmchip{chip}")
 
 
 class DisplayHATMini:
@@ -27,10 +95,6 @@ class DisplayHATMini:
     Driver for the Pimoroni Display HAT Mini.
 
     A 320x240 IPS display with RGB backlight LED and four buttons.
-
-    Args:
-        backlight_pwm: If True, use PWM for dimmable backlight.
-                      If False (default), use simple on/off control.
     """
 
     # Button GPIO pins (active low with pull-up)
@@ -54,12 +118,13 @@ class DisplayHATMini:
     WIDTH = 320
     HEIGHT = 240
 
-    # PWM frequency for software PWM fallback
+    # PWM frequencies
     LED_PWM_FREQ = 2000
-    BACKLIGHT_PWM_FREQ = 10000  # 10 kHz for reduced flicker
+    BACKLIGHT_PWM_FREQ = 2000  # 2 kHz - works well across all brightness levels
 
-    # Hardware PWM frequency (pigpio) - can be much higher for flicker-free
-    BACKLIGHT_HW_PWM_FREQ = 25000  # 25 kHz
+    # Kernel PWM configuration (GPIO 13 = PWM1 = channel 1)
+    PWM_CHIP = 0
+    PWM_CHANNEL = 1
 
     # SPI speed - 80 MHz works reliably and gives good performance
     SPI_SPEED_HZ = 80_000_000  # 80 MHz
@@ -74,16 +139,19 @@ class DisplayHATMini:
                          Can try 100_000_000 for ~20 FPS if display is stable.
 
         Note:
-            For flicker-free backlight dimming, install pigpio and start the daemon:
-                sudo apt install pigpio python3-pigpio
-                sudo systemctl enable pigpiod
-                sudo systemctl start pigpiod
+            For flicker-free backlight dimming, enable kernel PWM overlay:
+                Add to /boot/firmware/config.txt:
+                    dtoverlay=pwm-2chan,pin=13,func=4,pin2=18,func2=2
+                Then reboot.
+
+            For completely flicker-free operation, add a 0.1µF capacitor
+            between GPIO 13 and GND.
         """
         self._backlight_pwm_enabled = backlight_pwm
         self._spi_speed = spi_speed_hz or self.SPI_SPEED_HZ
         self._button_callback = None
-        self._pigpio = None
-        self._using_hw_pwm = False
+        self._kernel_pwm = None
+        self._using_kernel_pwm = False
 
         # Initialize GPIO
         GPIO.setmode(GPIO.BCM)
@@ -104,25 +172,20 @@ class DisplayHATMini:
         # Set up backlight
         self._backlight_pwm = None
         if backlight_pwm:
-            # Try hardware PWM via pigpio first (flicker-free)
-            if _PIGPIO_AVAILABLE:
+            # Try kernel sysfs PWM first (most stable)
+            if KernelPWM.is_available(self.PWM_CHIP, self.PWM_CHANNEL):
                 try:
-                    self._pigpio = pigpio.pi()
-                    if self._pigpio.connected:
-                        # Use hardware PWM: frequency in Hz, duty 0-1000000
-                        self._pigpio.hardware_PWM(
-                            self.BACKLIGHT,
-                            self.BACKLIGHT_HW_PWM_FREQ,
-                            1000000  # 100% duty = full brightness
-                        )
-                        self._using_hw_pwm = True
-                    else:
-                        self._pigpio = None
+                    self._kernel_pwm = KernelPWM(self.PWM_CHIP, self.PWM_CHANNEL)
+                    if self._kernel_pwm._export():
+                        self._kernel_pwm.set_frequency(self.BACKLIGHT_PWM_FREQ)
+                        self._kernel_pwm.set_duty_cycle(100)
+                        self._kernel_pwm.enable()
+                        self._using_kernel_pwm = True
                 except Exception:
-                    self._pigpio = None
+                    self._kernel_pwm = None
 
-            # Fall back to software PWM if hardware PWM not available
-            if not self._using_hw_pwm:
+            # Fall back to software PWM if kernel PWM not available
+            if not self._using_kernel_pwm:
                 GPIO.setup(self.BACKLIGHT, GPIO.OUT)
                 self._backlight_pwm = GPIO.PWM(self.BACKLIGHT, self.BACKLIGHT_PWM_FREQ)
                 self._backlight_pwm.start(100)  # Full brightness
@@ -189,13 +252,9 @@ class DisplayHATMini:
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"Backlight value must be between 0.0 and 1.0 (got {value})")
 
-        if self._using_hw_pwm and self._pigpio:
-            # Hardware PWM: duty cycle is 0-1000000
-            self._pigpio.hardware_PWM(
-                self.BACKLIGHT,
-                self.BACKLIGHT_HW_PWM_FREQ,
-                int(value * 1000000)
-            )
+        if self._using_kernel_pwm and self._kernel_pwm:
+            # Kernel sysfs PWM
+            self._kernel_pwm.set_duty_cycle(value * 100)
         elif self._backlight_pwm:
             # Software PWM fallback
             self._backlight_pwm.ChangeDutyCycle(value * 100)
@@ -265,8 +324,8 @@ class DisplayHATMini:
 
     @property
     def using_hardware_pwm(self) -> bool:
-        """Return True if using hardware PWM for backlight (flicker-free)."""
-        return self._using_hw_pwm
+        """Return True if using hardware PWM for backlight (kernel sysfs PWM)."""
+        return self._using_kernel_pwm
 
     def _cleanup(self) -> None:
         """Clean up GPIO resources."""
@@ -276,10 +335,9 @@ class DisplayHATMini:
         if self._backlight_pwm:
             self._backlight_pwm.stop()
 
-        # Stop hardware PWM
-        if self._pigpio and self._using_hw_pwm:
-            self._pigpio.hardware_PWM(self.BACKLIGHT, 0, 0)
-            self._pigpio.stop()
+        # Stop kernel PWM
+        if self._kernel_pwm:
+            self._kernel_pwm.cleanup()
 
         # Turn off LED and backlight
         for pin in (self.LED_R, self.LED_G, self.LED_B):

@@ -54,6 +54,18 @@ Or add to `/boot/firmware/config.txt`:
 dtparam=spi=on
 ```
 
+#### Optional: Flicker-Free Backlight Dimming
+
+For smooth, flicker-free backlight dimming, enable kernel PWM by adding this line to `/boot/firmware/config.txt`:
+
+```ini
+dtoverlay=pwm-2chan,pin=13,func=4,pin2=18,func2=2
+```
+
+Then reboot. The library will automatically use kernel PWM when available, falling back to software PWM otherwise.
+
+**Hardware fix for completely flicker-free operation:** Add a 0.1µF ceramic capacitor between GPIO 13 and GND. This eliminates all brightness spikes and dips, especially noticeable at mid-range brightness levels.
+
 ### System Dependencies
 
 ```bash
@@ -148,12 +160,13 @@ DisplayHATMini.HEIGHT  # 240
 
 | Method | Description |
 |--------|-------------|
-| `__init__(backlight_pwm=False)` | Initialize display. Set `backlight_pwm=True` for dimmable backlight. |
+| `__init__(backlight_pwm=False, spi_speed_hz=None)` | Initialize display. Set `backlight_pwm=True` for dimmable backlight. Default SPI speed is 80 MHz. |
 | `set_led(r, g, b)` | Set RGB LED color (0.0–1.0 per channel) |
 | `set_backlight(value)` | Set backlight brightness (0.0–1.0) |
 | `display(image)` | Send PIL Image to the display |
 | `on_button_pressed(callback)` | Register button event callback |
 | `read_button(pin)` | Read button state (True = pressed) |
+| `using_hardware_pwm` | Property: True if using kernel PWM for backlight |
 
 ## Examples
 
@@ -162,6 +175,27 @@ See the `examples/` directory:
 - `hello.py` — Basic display and LED test
 - `pong.py` — Classic Pong game using the buttons
 - `backlight_pwm.py` — Backlight dimming demo
+
+## Technical Notes
+
+### Backlight PWM
+
+When `backlight_pwm=True`, the library uses a 2 kHz PWM signal for smooth dimming:
+
+- **Kernel PWM** (preferred): Uses `/sys/class/pwm` interface — rock-solid timing, no CPU jitter
+- **Software PWM** (fallback): Uses `RPi.GPIO.PWM` — may have occasional brightness fluctuations
+
+The library automatically detects and uses kernel PWM when the overlay is enabled.
+
+**Why 2 kHz?** Higher frequencies (5–10 kHz) cause the backlight to appear black at low brightness levels (below 20%). At 2 kHz, all brightness levels work correctly from 0% to 100%.
+
+### Performance
+
+The display runs at 80 MHz SPI by default, achieving ~17 FPS for full-screen updates. If you experience display artifacts, try lowering the speed:
+
+```python
+display = DisplayHATMini(spi_speed_hz=52_000_000)  # 52 MHz
+```
 
 ## Migrating from displayhatmini
 
